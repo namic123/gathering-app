@@ -20,6 +20,12 @@ import java.time.LocalTime;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.moim.moimbackend.vote.entity.CandidateType;
+import com.moim.moimbackend.vote.repository.ParticipantRepository;
+import com.moim.moimbackend.vote.repository.VoteRepository;
 
 /**
  * 모임 생성/조회 비즈니스 로직.
@@ -37,7 +43,8 @@ import java.util.List;
 public class GatheringService {
 
     private final GatheringRepository gatheringRepository;
-
+    private final ParticipantRepository participantRepository;
+    private final VoteRepository voteRepository;
     /**
      * 모임 생성.
      * <p>
@@ -176,48 +183,74 @@ public class GatheringService {
      * voteCount는 아직 0 → D3(투표 도메인)에서 집계 로직 추가 예정.
      */
     public GatheringDetailResponse getGathering(String shareCode) {
+        // 로그 기록: 모임 조회 시작 시 공유 코드 출력
+        log.info("[모임 조회] shareCode={}", shareCode);
+
+        // 1. 공유 코드로 모임 엔티티 조회
+        // - 존재하지 않는 경우 BusinessException 발생 (GATHERING_NOT_FOUND 오류)
         Gathering gathering = gatheringRepository.findByShareCode(shareCode)
                 .orElseThrow(() -> new BusinessException(ErrorCode.GATHERING_NOT_FOUND));
 
-        // 시간 후보 → 응답 DTO 변환
+        // 2. 시간별 후보와 장소별 후보에 대한 득표수 Map 생성
+        // - 후보 ID를 key, 득표수를 value로 매핑
+        Map<Long, Long> timeVoteMap = buildVoteCountMap(gathering.getId(), CandidateType.TIME); // 시간 후보 득표수 매핑
+        Map<Long, Long> placeVoteMap = buildVoteCountMap(gathering.getId(), CandidateType.PLACE); // 장소 후보 득표수 매핑
+
+        // 3. 시간 후보 데이터 변환
+        // - Gathering에 저장된 시간 후보 엔티티를 `GatheringDetailResponse.TimeCandidateItem`으로 매핑
         List<GatheringDetailResponse.TimeCandidateItem> timeItems =
                 gathering.getTimeCandidates().stream()
                         .map(tc -> GatheringDetailResponse.TimeCandidateItem.builder()
-                                .id(tc.getId())
-                                .date(tc.getCandidateDate().toString())
-                                .startTime(tc.getStartTime().toString())
-                                .endTime(tc.getEndTime() != null ? tc.getEndTime().toString() : null)
-                                .voteCount(0)  // TODO: D3에서 실제 투표 수로 교체
+                                .id(tc.getId()) // 후보 ID
+                                .date(tc.getCandidateDate().toString()) // 날짜
+                                .startTime(tc.getStartTime().toString()) // 시작 시간
+                                .endTime(tc.getEndTime() != null ? tc.getEndTime().toString() : null) // 종료 시간 (null일 수 있음)
+                                .voteCount(timeVoteMap.getOrDefault(tc.getId(), 0L)) // 득표수, 기본값 0
                                 .build())
-                        .toList();
+                        .toList(); // 최종적으로 변환된 리스트 생성
 
-        // 장소 후보 → 응답 DTO 변환
+        // 4. 장소 후보 데이터 변환
+        // - Gathering에 저장된 장소 후보 엔티티를 `GatheringDetailResponse.PlaceCandidateItem`으로 매핑
         List<GatheringDetailResponse.PlaceCandidateItem> placeItems =
                 gathering.getPlaceCandidates().stream()
                         .map(pc -> GatheringDetailResponse.PlaceCandidateItem.builder()
-                                .id(pc.getId())
-                                .name(pc.getName())
-                                .mapLink(pc.getMapLink())
-                                .memo(pc.getMemo())
-                                .estCost(pc.getEstCost())
-                                .travelMin(pc.getTravelMin())
+                                .id(pc.getId()) // 후보 ID
+                                .name(pc.getName()) // 장소 이름
+                                .mapLink(pc.getMapLink()) // 지도 링크
+                                .memo(pc.getMemo()) // 메모
+                                .estCost(pc.getEstCost()) // 예상 비용
+                                .travelMin(pc.getTravelMin()) // 예상 소요 시간 (분 단위)
                                 .moodTags(pc.getMoodTags() != null
-                                        ? Arrays.asList(pc.getMoodTags().split(","))
-                                        : Collections.emptyList())
-                                .voteCount(0)  // TODO: D3에서 교체
+                                        ? Arrays.asList(pc.getMoodTags().split(",")) // 분위기 태그를 ","로 분리해 리스트로 변환
+                                        : Collections.emptyList()) // moodTags가 null인 경우 빈 리스트 반환
+                                .voteCount(placeVoteMap.getOrDefault(pc.getId(), 0L)) // 득표수, 기본값 0
                                 .build())
-                        .toList();
+                        .toList(); // 최종적으로 변환된 리스트 생성
 
+        // 5. 참여자 수 계산
+        // - 해당 모임에 등록된 참여자 수를 조회
+        long participantCount = participantRepository.countByGatheringId(gathering.getId());
+
+        // 6. 결과 응답 객체 빌드 및 반환
         return GatheringDetailResponse.builder()
-                .title(gathering.getTitle())
-                .hostName(gathering.getHostName())
-                .description(gathering.getDescription())
-                .type(gathering.getType().name())
-                .status(gathering.getStatus().name())
-                .deadline(gathering.getDeadline().toString())
-                .timeCandidates(timeItems)
-                .placeCandidates(placeItems)
-                .participantCount(0)  // TODO: D3에서 실제 참여자 수로 교체
+                .title(gathering.getTitle()) // 모임 제목
+                .hostName(gathering.getHostName()) // 호스트 이름
+                .description(gathering.getDescription()) // 모임 설명
+                .type(gathering.getType().name()) // 모임 타입 (문자열)
+                .status(gathering.getStatus().name()) // 모임 상태 (문자열)
+                .deadline(gathering.getDeadline().toString()) // 마감 시간 (문자열)
+                .timeCandidates(timeItems) // 변환된 시간 후보 리스트
+                .placeCandidates(placeItems) // 변환된 장소 후보 리스트
+                .participantCount((int) participantCount) // 참여자 수
                 .build();
+    }
+    /** 후보별 득표수 Map 조립 */
+    private Map<Long, Long> buildVoteCountMap(Long gatheringId, CandidateType type) {
+        // 후보 ID → 득표수를 매핑하는 Map 생성
+        return voteRepository.countByGatheringAndType(gatheringId, type).stream()
+                .collect(Collectors.toMap(
+                        row -> (Long) row[0],   // 후보 ID (첫 번째 컬럼)
+                        row -> (Long) row[1]    // 득표 수 (두 번째 컬럼)
+                ));
     }
 }
